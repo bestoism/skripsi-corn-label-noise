@@ -13,6 +13,7 @@ Cara pakai (di Colab, setelah mount Drive & clone repo):
 
 import os
 import json
+import pickle  # tambahkan di bagian import paling atas file
 import time
 import random
 from datetime import datetime
@@ -72,26 +73,22 @@ def _safe_scrape_call(fetch_fn, max_retries=MAX_RETRIES):
 
 
 # ==========================================================
-# CHECKPOINT — BENAR-BENAR RESUMABLE (beda dari versi lama)
+# CHECKPOINT — BENAR-BENAR RESUMABLE (fix: pakai pickle, bukan json,
+# karena continuation_token dari google_play_scraper adalah object
+# custom _ContinuationToken, bukan tipe data primitif yang bisa
+# di-JSON-kan langsung)
 # ==========================================================
 def _state_path(app_name, score):
-    return os.path.join(STATE_DIR, f"{app_name}_score{score}.json")
+    return os.path.join(STATE_DIR, f"{app_name}_score{score}.pkl")  # <-- .pkl, bukan .json
 
 
 def _load_state(app_name, score):
-    """
-    Memuat state SEKALIGUS data yang sudah terkumpul dari CSV checkpoint.
-    Versi lama hanya menyimpan continuation_token & jumlah, tapi TIDAK
-    pernah membaca ulang baris yang sudah terkumpul saat restart -- jadi
-    proses selalu mulai dari nol meski state file ada. Di sini, data
-    checkpoint CSV ikut dimuat balik sebagai starting point.
-    """
     state_path = _state_path(app_name, score)
     checkpoint_csv = os.path.join(RAW_DIR, "_checkpoints", f"{app_name}_score{score}.csv")
 
     if os.path.exists(state_path) and os.path.exists(checkpoint_csv):
-        with open(state_path, "r") as f:
-            state = json.load(f)
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
         df_existing = pd.read_csv(checkpoint_csv)
         print(f"   🔄 Resume {app_name} rating={score}: {len(df_existing)} baris sudah ada")
         return state.get("continuation_token"), df_existing.to_dict("records")
@@ -104,8 +101,8 @@ def _save_checkpoint(app_name, score, continuation_token, collected):
     state_path = _state_path(app_name, score)
     checkpoint_csv = os.path.join(RAW_DIR, "_checkpoints", f"{app_name}_score{score}.csv")
 
-    with open(state_path, "w") as f:
-        json.dump({"continuation_token": continuation_token, "collected": len(collected)}, f)
+    with open(state_path, "wb") as f:
+        pickle.dump({"continuation_token": continuation_token, "collected": len(collected)}, f)
     pd.DataFrame(collected).to_csv(checkpoint_csv, index=False)
 
 
