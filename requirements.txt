@@ -1,0 +1,13 @@
+torch
+transformers
+cleanlab
+coral-pytorch
+google-play-scraper
+pandas
+numpy
+scikit-learn
+scipy
+statsmodels
+tqdm
+matplotlib
+seaborn
