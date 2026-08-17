@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 
@@ -7,17 +8,45 @@ VALID_VERDICTS = {"noise", "not_noise", "ambiguous"}
 
 
 def _load_validated_sample():
-    try:
-        # sep=None + engine="python" -> auto-detect delimiter (koma ATAU titik
-        # koma). Perlu karena Excel dengan locale Indonesia otomatis mengganti
-        # delimiter CSV jadi ';' saat file di-save ulang -- kita tidak bisa
-        # kontrol software apa yang dipakai user untuk isi validasi manual,
-        # jadi baca-nya yang harus fleksibel.
-        df = pd.read_csv(config.HUMAN_VALIDATION_FILE, sep=None, engine="python")
-    except FileNotFoundError:
+    """
+    Coba baca dengan delimiter ';' dulu (umum terjadi kalau file diedit
+    lewat Excel locale Indonesia -- Excel otomatis ganti delimiter CSV
+    jadi ';' karena koma dipakai sebagai pemisah desimal), fallback ke ','
+    kalau gagal atau kolom 'human_verdict' tidak ketemu.
+
+    TIDAK pakai sep=None (auto-detect): csv.Sniffer salah tebak delimiter
+    jadi koma pada file ini, karena teks ulasan mengandung jauh lebih
+    banyak koma (di dalam kalimat) dibanding titik-koma (delimiter kolom
+    sebenarnya) -- auto-detect tertipu oleh frekuensi karakter di dalam teks.
+    """
+    if not os.path.exists(config.HUMAN_VALIDATION_FILE):
         print(f"⚠️ File belum ada: {config.HUMAN_VALIDATION_FILE}")
         print("   Jalankan clean.py dulu untuk men-generate file sample-nya.")
         return None
+
+    df = None
+    tried = []
+    for sep in [";", ","]:
+        try:
+            candidate = pd.read_csv(config.HUMAN_VALIDATION_FILE, sep=sep)
+            tried.append(f"'{sep}' -> kolom: {candidate.columns.tolist()}")
+            if "human_verdict" in candidate.columns:
+                df = candidate
+                print(f"   (file dibaca dengan delimiter '{sep}')")
+                break
+        except pd.errors.ParserError:
+            tried.append(f"'{sep}' -> ParserError")
+            continue
+
+    if df is None:
+        print("⚠️ Gagal membaca file dengan delimiter ';' maupun ','.")
+        for t in tried:
+            print(f"   Percobaan: {t}")
+        raise ValueError(
+            f"Gagal membaca {config.HUMAN_VALIDATION_FILE}. "
+            f"Cek manual isi filenya -- kemungkinan ada karakter yang "
+            f"merusak struktur CSV (kutip tidak seimbang, delimiter campur, dst.)."
+        )
 
     df["human_verdict"] = df["human_verdict"].astype(str).str.strip().str.lower()
     return df
@@ -26,9 +55,8 @@ def _load_validated_sample():
 def _check_completeness(df):
     """
     Cek dua hal: (1) tidak ada baris kosong, (2) tidak ada nilai typo di luar
-    3 kategori valid. Versi lama cuma cek kosong -- typo seperti 'noize' atau
-    'ambigous' akan lolos diam-diam dan bikin hitungan agreement rate salah
-    tanpa error apa pun.
+    3 kategori valid. Typo seperti 'noize' atau 'ambigous' akan lolos diam-diam
+    dan bikin hitungan agreement rate salah tanpa error apa pun kalau tidak dicek.
     """
     empty_mask = df["human_verdict"].isin(["", "nan", "none"]) | df["human_verdict"].isna()
     n_empty = empty_mask.sum()
@@ -86,7 +114,6 @@ def compute_agreement():
     print(f"Ambigu                : {ambiguous} ({ambiguous/total*100:.1f}%)")
     print(f"Tidak setuju          : {disagree} ({disagree/total*100:.1f}%)")
 
-    # ---- breakdown per-bin rating_diff (bukti langsung utk asumsi severity-aware) ----
     print("\n📊 Agreement rate per rating_diff (mendukung/menolak asumsi severity-aware pruning):")
     breakdown_rows = []
     for diff_val, group in df.groupby("rating_diff"):
