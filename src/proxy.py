@@ -16,6 +16,11 @@ from src.data import ReviewDataset
 from src.models import IndoBERTStandard, IndoBERTCORN
 from coral_pytorch.losses import corn_loss
 
+# Import tambahan untuk fusion
+from src.sentiment_fusion import compute_sentiment_scores, get_sentiment_dim
+from src.data import ReviewDatasetFusion
+from src.models import IndoBERTCORNFusion
+
 
 # ==========================================================
 # CACHE HELPER — dipakai semua metode, supaya tidak recompute
@@ -107,8 +112,8 @@ def _corn_logits_to_probas(logits):
 
 
 # ==========================================================
-# FINE-TUNE K-FOLD GENERIK (dipakai proxy 2, 3, 4)
-# loss_type: "ce" atau "corn" | extra_input: None atau tensor sentimen (proxy 4)
+# FINE-TUNE K-FOLD GENERIK (dipakai proxy 2, 3)
+# loss_type: "ce" atau "corn"
 # ==========================================================
 def _finetune_kfold_oof(texts, labels, loss_type, use_sentiment_fusion=False):
     cached = _load_cache_if_valid(config.PROXY_PRED_PROBS_FILE, config.PROXY_PRED_PROBS_META_FILE, texts)
@@ -176,6 +181,86 @@ def _finetune_kfold_oof(texts, labels, loss_type, use_sentiment_fusion=False):
 
 
 # ==========================================================
+# FINE-TUNE FUSION K-FOLD (dipakai proxy 4)
+# ==========================================================
+def _finetune_fusion_kfold_oof(texts, labels):
+    """P5: sama seperti _finetune_kfold_oof (CORN), tapi model & dataset-nya
+    versi fusion -- representasi IndoBERT digabung skor sentimen eksternal
+    sebelum classifier CORN."""
+    cached = _load_cache_if_valid(config.PROXY_PRED_PROBS_FILE, config.PROXY_PRED_PROBS_META_FILE, texts)
+    if cached is not None:
+        return cached
+
+    sentiment_scores = compute_sentiment_scores(texts)
+    sentiment_dim = get_sentiment_dim()
+
+    torch.manual_seed(42)
+    n = len(texts)
+    oof = np.zeros((n, config.NUM_CLASSES), dtype=np.float32)
+    texts_arr = np.array(texts, dtype=object)
+    labels_arr = np.array(labels)
+
+    skf = StratifiedKFold(n_splits=config.PROXY_CV_FOLDS, shuffle=True, random_state=42)
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(texts_arr, labels_arr)):
+        print(f"   [Proxy {config.PROXY_NAME}] Fold {fold + 1}/{config.PROXY_CV_FOLDS} "
+              f"(train={len(train_idx)}, val={len(val_idx)})...")
+
+        model = IndoBERTCORNFusion(sentiment_dim).to(config.DEVICE)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.PROXY_FINETUNE_LR)
+
+        train_ds = ReviewDatasetFusion(
+            texts_arr[train_idx].tolist(), (labels_arr[train_idx] + 1).tolist(),
+            sentiment_scores[train_idx],
+        )
+        val_ds = ReviewDatasetFusion(
+            texts_arr[val_idx].tolist(), (labels_arr[val_idx] + 1).tolist(),
+            sentiment_scores[val_idx],
+        )
+        train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=config.BATCH_SIZE, shuffle=False)
+
+        scaler = torch.cuda.amp.GradScaler()
+        model.train()
+        for epoch in range(config.PROXY_FINETUNE_EPOCHS):
+            epoch_loss = 0.0
+            for batch in train_loader:
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(config.DEVICE)
+                attention_mask = batch["attention_mask"].to(config.DEVICE)
+                sentiment = batch["sentiment"].to(config.DEVICE)
+                lbl = batch["labels"].to(config.DEVICE)
+
+                with torch.cuda.amp.autocast():
+                    logits = model(input_ids, attention_mask, sentiment)
+                    loss = corn_loss(logits, lbl, num_classes=config.NUM_CLASSES)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                epoch_loss += loss.item()
+            print(f"      Epoch {epoch + 1}/{config.PROXY_FINETUNE_EPOCHS} - Loss: {epoch_loss / len(train_loader):.4f}")
+
+        model.eval()
+        fold_probs = []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(config.DEVICE)
+                attention_mask = batch["attention_mask"].to(config.DEVICE)
+                sentiment = batch["sentiment"].to(config.DEVICE)
+                logits = model(input_ids, attention_mask, sentiment)
+                probs = _corn_logits_to_probas(logits).cpu().numpy()
+                fold_probs.append(probs)
+
+        oof[val_idx] = np.concatenate(fold_probs, axis=0)
+        del model, optimizer
+        torch.cuda.empty_cache()
+
+    _save_cache(config.PROXY_PRED_PROBS_FILE, config.PROXY_PRED_PROBS_META_FILE, texts, oof)
+    return oof
+
+
+# ==========================================================
 # DISPATCHER — SATU-SATUNYA FUNGSI YANG DIPANGGIL DARI clean.py
 # ==========================================================
 def get_proxy_pred_probs(texts, labels):
@@ -194,13 +279,6 @@ def get_proxy_pred_probs(texts, labels):
     elif config.PROXY_ID == 3:
         return _finetune_kfold_oof(texts, labels, loss_type="corn")
     elif config.PROXY_ID == 4:
-        # NOTE: fusi sentimen eksternal (P5) butuh implementasi tambahan di
-        # model forward (concat skor sentimen sebelum classifier head).
-        # Ditandai belum diimplementasikan penuh di sini -- lihat catatan di bawah.
-        raise NotImplementedError(
-            "Proxy 4 (fusion) butuh varian model IndoBERTCORNFusion terpisah "
-            "di models.py. Beri tahu saya kalau kamu mau lanjut ke proxy ini "
-            "-- kita tambahkan sebagai langkah berikutnya."
-        )
+        return _finetune_fusion_kfold_oof(texts, labels)
     else:
         raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID} (harus 0-4)")
