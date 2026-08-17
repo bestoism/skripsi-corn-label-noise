@@ -35,11 +35,8 @@ TRAIN_RAW_FILE = os.path.join(DATA_PROCESSED_DIR, "split_train_raw.csv")
 TEST_FILE = os.path.join(DATA_PROCESSED_DIR, "split_test.csv")
 
 # ==========================================================
-# 3. REGISTRY PROXY CLASSIFIER — GANTI PROXY DI SINI SAJA
+# 3. REGISTRY PROXY CLASSIFIER — GANTI PROXY DENGAN set_proxy(id)
 # ==========================================================
-# Cukup ubah angka PROXY_ID di bawah untuk pindah metode proxy.
-# Semua path cache/model/hasil otomatis mengikuti nama metode ini,
-# jadi tidak akan pernah saling menimpa antar metode.
 PROXY_REGISTRY = {
     0: {"name": "frozen_cls_lr",        "desc": "CLS embedding beku + Logistic Regression (P1)"},
     1: {"name": "frozen_meanpool_lr",   "desc": "Mean-pooling embedding beku + Logistic Regression (P2)"},
@@ -48,27 +45,41 @@ PROXY_REGISTRY = {
     4: {"name": "finetuned_corn_fusion","desc": "IndoBERT+CORN + fusi sentimen eksternal (P5)"},
 }
 
-PROXY_ID = 3   # <--- UBAH ANGKA INI SAJA UNTUK GANTI PROXY (0-4)
+def set_proxy(proxy_id):
+    """
+    Ganti proxy aktif dengan AMAN di tengah sesi Python -- TANPA
+    importlib.reload(config). reload() berbahaya karena menjalankan ulang
+    SELURUH file config.py dari awal (termasuk nilai default hardcode),
+    me-reset semua path turunan proxy sebelum sempat kamu timpa lagi.
+    Pakai ini di notebook: config.set_proxy(pid)
+    JANGAN pakai: config.PROXY_ID = pid lalu importlib.reload(config)
+    """
+    global PROXY_ID, PROXY_NAME, PROXY_DESC
+    global PROXY_PRED_PROBS_FILE, PROXY_PRED_PROBS_META_FILE
+    global TRAIN_CLEANED_HARD_FILE, TRAIN_CLEANED_SEVERE_FILE, MODEL_CKPT_DIR
 
-PROXY_NAME = PROXY_REGISTRY[PROXY_ID]["name"]
-PROXY_DESC = PROXY_REGISTRY[PROXY_ID]["desc"]
+    if proxy_id not in PROXY_REGISTRY:
+        raise ValueError(f"PROXY_ID tidak dikenal: {proxy_id} (harus 0-4)")
 
-# Path proxy & hasil cleaning otomatis ter-suffix nama proxy aktif
-PROXY_PRED_PROBS_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs__{PROXY_NAME}.npy")
-PROXY_PRED_PROBS_META_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs_meta__{PROXY_NAME}.csv")
+    PROXY_ID = proxy_id
+    PROXY_NAME = PROXY_REGISTRY[proxy_id]["name"]
+    PROXY_DESC = PROXY_REGISTRY[proxy_id]["desc"]
+
+    PROXY_PRED_PROBS_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs__{PROXY_NAME}.npy")
+    PROXY_PRED_PROBS_META_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs_meta__{PROXY_NAME}.csv")
+    TRAIN_CLEANED_HARD_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_hard__{PROXY_NAME}.csv")
+    TRAIN_CLEANED_SEVERE_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_severe__{PROXY_NAME}.csv")
+    MODEL_CKPT_DIR = os.path.join(MODEL_CKPT_ROOT, PROXY_NAME)
+    os.makedirs(MODEL_CKPT_DIR, exist_ok=True)
+
+    print(f"📌 Proxy aktif: [{PROXY_ID}] {PROXY_NAME} — {PROXY_DESC}")
+
 EMBEDDING_CACHE_FILE = os.path.join(PROXY_CACHE_DIR, "embeddings_meanpool.npy")
 EMBEDDING_CACHE_META_FILE = os.path.join(PROXY_CACHE_DIR, "embeddings_meanpool_meta.csv")
 
-TRAIN_CLEANED_HARD_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_hard__{PROXY_NAME}.csv")
-TRAIN_CLEANED_SEVERE_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_severe__{PROXY_NAME}.csv")
-
-# Checkpoint model final JUGA dipisah per proxy aktif, supaya percobaan
-# dengan proxy berbeda tidak saling menimpa checkpoint satu sama lain.
-MODEL_CKPT_DIR = os.path.join(MODEL_CKPT_ROOT, PROXY_NAME)
-os.makedirs(MODEL_CKPT_DIR, exist_ok=True)
-
-# Tabel perbandingan kualitas antar-proxy (dipakai utk pilot study Bab 1)
 PROXY_QUALITY_LOG_FILE = os.path.join(RESULTS_DIR, "proxy_ablation_table.csv")
+
+set_proxy(3)   # panggil sekali di sini -- inilah default saat modul di-import pertama kali
 
 # ==========================================================
 # 4. MODEL & HYPERPARAMETER (SAMA UNTUK SEMUA SKENARIO)
@@ -128,5 +139,3 @@ FINAL_RESULTS_TABLE_FILE = os.path.join(RESULTS_DIR, "final_results_table.csv")
 SIGNIFICANCE_TEST_FILE = os.path.join(RESULTS_DIR, "significance_test.csv")
 NOISE_SAMPLES_FILE = os.path.join(DATA_PROCESSED_DIR, "detected_noise_samples.csv")
 PROGRESS_FILE = os.path.join(LOGS_DIR, "experiment_progress.json")
-
-print(f"📌 Proxy aktif: [{PROXY_ID}] {PROXY_NAME} — {PROXY_DESC}")
