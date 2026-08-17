@@ -8,7 +8,12 @@ VALID_VERDICTS = {"noise", "not_noise", "ambiguous"}
 
 def _load_validated_sample():
     try:
-        df = pd.read_csv(config.HUMAN_VALIDATION_FILE)
+        # sep=None + engine="python" -> auto-detect delimiter (koma ATAU titik
+        # koma). Perlu karena Excel dengan locale Indonesia otomatis mengganti
+        # delimiter CSV jadi ';' saat file di-save ulang -- kita tidak bisa
+        # kontrol software apa yang dipakai user untuk isi validasi manual,
+        # jadi baca-nya yang harus fleksibel.
+        df = pd.read_csv(config.HUMAN_VALIDATION_FILE, sep=None, engine="python")
     except FileNotFoundError:
         print(f"⚠️ File belum ada: {config.HUMAN_VALIDATION_FILE}")
         print("   Jalankan clean.py dulu untuk men-generate file sample-nya.")
