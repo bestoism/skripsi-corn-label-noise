@@ -62,18 +62,21 @@ def export_human_validation_sample(df_noise, n=None):
 
 
 # ==========================================================
-# 2. LOG KUALITAS PROXY — akumulatif, idempotent per PROXY_ID
+# 2. LOG KUALITAS PROXY — akumulatif, idempotent per (proxy_id, data_version)
 # ==========================================================
 def _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged):
     """
-    Satu baris per proxy_id di results/proxy_ablation_table.csv (dipakai
-    untuk pilot study Bab 1). Idempotent: kalau clean.py dijalankan ulang
-    dengan PROXY_ID yang sama, baris lama diganti -- bukan duplikat.
+    Satu baris per (proxy_id, data_version) di results/proxy_ablation_table.csv.
+    Idempotent: kalau clean.py dijalankan ulang dengan kombinasi proxy+data
+    yang sama, baris lama diganti -- bukan duplikat. Kombinasi BERBEDA
+    (mis. P4 di data v1 vs v2) tetap berdampingan, tidak saling menimpa --
+    ini yang sebelumnya bug karena kunci dedup cuma proxy_id.
     """
     row = {
         "proxy_id": config.PROXY_ID,
         "proxy_name": config.PROXY_NAME,
         "proxy_desc": config.PROXY_DESC,
+        "data_version": config.DATA_VERSION,
         "accuracy": proxy_acc,
         "mae": proxy_metrics["mae"],
         "off_by_one": proxy_metrics["off_by_one"],
@@ -84,8 +87,15 @@ def _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged):
 
     if os.path.exists(config.PROXY_QUALITY_LOG_FILE):
         existing = pd.read_csv(config.PROXY_QUALITY_LOG_FILE)
-        existing = existing[existing["proxy_id"] != config.PROXY_ID]
-        log_df = pd.concat([existing, log_df], ignore_index=True).sort_values("proxy_id")
+        if "data_version" not in existing.columns:
+            existing["data_version"] = "v1"  # baris lama sebelum kolom ini ada
+        existing = existing[
+            ~((existing["proxy_id"] == config.PROXY_ID) &
+              (existing["data_version"] == config.DATA_VERSION))
+        ]
+        log_df = pd.concat([existing, log_df], ignore_index=True).sort_values(
+            ["data_version", "proxy_id"]
+        )
 
     log_df.to_csv(config.PROXY_QUALITY_LOG_FILE, index=False)
     print(f"📄 Tabel ablasi proxy diperbarui -> {config.PROXY_QUALITY_LOG_FILE}")
@@ -96,7 +106,8 @@ def _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged):
 # ==========================================================
 def run_confident_learning():
     print("=" * 60)
-    print(f" CONFIDENT LEARNING — proxy aktif: [{config.PROXY_ID}] {config.PROXY_NAME} ")
+    print(f" CONFIDENT LEARNING — proxy aktif: [{config.PROXY_ID}] {config.PROXY_NAME} "
+          f"| data: {config.DATA_VERSION} ")
     print("=" * 60)
 
     df_train = pd.read_csv(config.TRAIN_RAW_FILE)
@@ -112,7 +123,6 @@ def run_confident_learning():
     labels = df_train["rating"].values - 1  # 0-indexed
     texts = df_train["cleaned_text"].tolist()
 
-    # ---- INTEGRASI DENGAN proxy.py: satu panggilan, tidak perduli metodenya ----
     pred_probs = get_proxy_pred_probs(texts, labels)
 
     if pred_probs.shape != (len(texts), config.NUM_CLASSES):
@@ -126,7 +136,7 @@ def run_confident_learning():
     proxy_acc = (proxy_preds == labels).mean()
     proxy_metrics = compute_metrics(labels, proxy_preds)
 
-    print(f"\n📐 Kualitas proxy [{config.PROXY_NAME}]:")
+    print(f"\n📐 Kualitas proxy [{config.PROXY_NAME}] (data {config.DATA_VERSION}):")
     print(f"   Exact Accuracy : {proxy_acc:.4f}")
     print(f"   MAE            : {proxy_metrics['mae']:.4f}")
     print(f"   Off-by-1 Acc   : {proxy_metrics['off_by_one']:.4f}")
@@ -136,7 +146,6 @@ def run_confident_learning():
     df_train["predicted_rating"] = proxy_preds + 1
     df_train["rating_diff"] = (df_train["rating"] - df_train["predicted_rating"]).abs()
 
-    # ---- filter cleanlab, >=2 metode dibandingkan ----
     results = {}
     print("\n🔎 Analisis Metode Filter Cleanlab:")
     for method in config.CLEANLAB_FILTER_METHODS:
@@ -163,7 +172,6 @@ def run_confident_learning():
 
     _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged=len(df_noise) / len(df_train) * 100)
 
-    # ---- path otomatis ter-suffix PROXY_NAME (lihat config.py) ----
     drop_cols = [c for c in df_cleaned_hard.columns
                  if c.startswith("is_noise") or c in ("predicted_rating", "rating_diff")]
     df_cleaned_hard.drop(columns=drop_cols, errors="ignore").to_csv(config.TRAIN_CLEANED_HARD_FILE, index=False)

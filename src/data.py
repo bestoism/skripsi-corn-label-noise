@@ -11,15 +11,16 @@ class ReviewDataset(Dataset):
     tidak perlu ingat konversi index -- semua dilakukan di sini, satu tempat.
     """
 
-    _tokenizer = None  # tokenizer di-cache di level class, tidak di-load ulang tiap instance
+    _tokenizer_cache = {}  # FIX: dict keyed by model name, bukan satu slot global
 
     def __init__(self, texts, labels):
         self.texts = texts
         self.labels = [int(l) - 1 for l in labels]  # 1-5 -> 0-4 (syarat PyTorch & CORN)
 
-        if ReviewDataset._tokenizer is None:
-            ReviewDataset._tokenizer = AutoTokenizer.from_pretrained(config.PRETRAINED_MODEL_NAME)
-        self.tokenizer = ReviewDataset._tokenizer
+        model_name = config.PRETRAINED_MODEL_NAME
+        if model_name not in ReviewDataset._tokenizer_cache:
+            ReviewDataset._tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = ReviewDataset._tokenizer_cache[model_name]
 
     def __len__(self):
         return len(self.texts)
@@ -45,6 +46,7 @@ class ReviewDataset(Dataset):
             "labels": torch.tensor(label, dtype=torch.long),
         }
         
+
 class ReviewDatasetFusion(Dataset):
     """
     Varian ReviewDataset yang juga membawa skor sentimen eksternal
@@ -58,9 +60,10 @@ class ReviewDatasetFusion(Dataset):
         self.labels = [int(l) - 1 for l in labels]
         self.sentiment_scores = sentiment_scores
 
-        if ReviewDataset._tokenizer is None:
-            ReviewDataset._tokenizer = AutoTokenizer.from_pretrained(config.PRETRAINED_MODEL_NAME)
-        self.tokenizer = ReviewDataset._tokenizer
+        model_name = config.PRETRAINED_MODEL_NAME
+        if model_name not in ReviewDataset._tokenizer_cache:
+            ReviewDataset._tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = ReviewDataset._tokenizer_cache[model_name]
 
     def __len__(self):
         return len(self.texts)

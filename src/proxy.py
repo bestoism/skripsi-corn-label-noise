@@ -45,8 +45,10 @@ def _save_cache(cache_file, meta_file, texts, array):
 # ==========================================================
 def _get_embeddings(texts, pooling="mean", batch_size=32):
     """pooling: 'cls' atau 'mean'. Cache mengikuti nama pooling agar tidak tercampur."""
-    cache_file = config.EMBEDDING_CACHE_FILE.replace(".npy", f"_{pooling}.npy")
-    meta_file = config.EMBEDDING_CACHE_META_FILE.replace(".csv", f"_{pooling}.csv")
+    # FIX: sertakan nama backbone di cache key, bukan cuma pooling
+    backbone_tag = config.PRETRAINED_MODEL_NAME.replace("/", "_")
+    cache_file = config.EMBEDDING_CACHE_FILE.replace(".npy", f"_{pooling}_{backbone_tag}.npy")
+    meta_file = config.EMBEDDING_CACHE_META_FILE.replace(".csv", f"_{pooling}_{backbone_tag}.csv")
 
     cached = _load_cache_if_valid(cache_file, meta_file, texts)
     if cached is not None:
@@ -270,15 +272,17 @@ def get_proxy_pred_probs(texts, labels):
     """
     print(f"\n🧮 Menghitung OOF pred_probs — proxy [{config.PROXY_ID}] {config.PROXY_NAME}")
 
+    # Catatan: proxy_id 6 (IndoBERTweet) akan diarahkan ke proxy 3 karena mekanismenya sama
     if config.PROXY_ID == 0:
         return _proxy_frozen_lr(texts, labels, pooling="cls")
     elif config.PROXY_ID == 1:
         return _proxy_frozen_lr(texts, labels, pooling="mean")
-    elif config.PROXY_ID == 2:
-        return _finetune_kfold_oof(texts, labels, loss_type="ce")
-    elif config.PROXY_ID == 3:
-        return _finetune_kfold_oof(texts, labels, loss_type="corn")
+    elif config.PROXY_ID in [2, 3, 6]:
+        # Jika proxy 6 (IndoBERTweet) atau 3 (IndoBERT CORN), loss-nya adalah corn
+        # Jika proxy 2, loss-nya adalah ce
+        loss_type = "corn" if config.PROXY_ID in [3, 6] else "ce"
+        return _finetune_kfold_oof(texts, labels, loss_type=loss_type)
     elif config.PROXY_ID == 4:
         return _finetune_fusion_kfold_oof(texts, labels)
     else:
-        raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID} (harus 0-4)")
+        raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID}")

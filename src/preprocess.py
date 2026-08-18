@@ -66,8 +66,11 @@ def _load_slang_lexicon():
     lexicon = {}
 
     if os.path.exists(SLANG_BASE_PATH):
-        # File asli kamus-alay TANPA header, 2 kolom: slang, formal
-        df_base = pd.read_csv(SLANG_BASE_PATH, header=None, names=["slang", "formal"])
+        # FIX: file aslinya punya 7 kolom (slang,formal,In-dictionary,context,
+        # category1,category2,category3) DENGAN header. usecols otomatis pakai
+        # header bawaan file dan ambil kolom yang benar berdasarkan NAMA,
+        # bukan posisi -- aman walau urutan/jumlah kolom sumber berubah.
+        df_base = pd.read_csv(SLANG_BASE_PATH, usecols=["slang", "formal"])
         lexicon.update(dict(zip(df_base["slang"], df_base["formal"])))
         print(f"📖 Kamus slang dasar: {len(df_base)} entri (Salsabila dkk., 2018)")
     else:
@@ -87,7 +90,7 @@ SLANG_DICT = _load_slang_lexicon()
 
 
 # ==========================================================
-# FUNGSI CLEANING (tidak berubah dari desain sebelumnya)
+# FUNGSI CLEANING
 # ==========================================================
 def replace_emoji_sentiment(text):
     for emo, word in EMOJI_SENTIMENT.items():
@@ -123,7 +126,7 @@ def clean_text_for_bert(text):
 
 
 # ==========================================================
-# FUNGSI ANALITIK & PIPELINE UTAMA (sama seperti sebelumnya)
+# FUNGSI ANALITIK & PIPELINE UTAMA
 # ==========================================================
 def compute_slang_coverage(df, raw_col="review_text"):
     all_words = ' '.join(df[raw_col].dropna().astype(str).str.lower()).split()
@@ -147,6 +150,25 @@ def compute_text_rating_conflicts(df, text_col="cleaned_text"):
     return n_conflicting
 
 
+def drop_text_rating_conflicts(df, text_col="cleaned_text"):
+    """
+    Buang SEMUA baris yang teksnya identik tapi rating-nya berbeda --
+    ini bukan kandidat noise (yang masih bisa didebat benar/salah),
+    tapi input identik dengan 2 label kontradiktif -- secara matematis
+    unlearnable untuk model apa pun. Kebijakan: buang semua baris
+    yang terlibat, bukan pilih salah satu (tidak ada dasar untuk
+    menentukan mana yang benar). Dokumentasikan di Batasan Penelitian.
+    """
+    dup_mask = df.duplicated(subset=[text_col], keep=False)
+    conflict_counts = df[dup_mask].groupby(text_col)["rating"].nunique()
+    conflicting_texts = conflict_counts[conflict_counts > 1].index
+
+    n_before = len(df)
+    df = df[~df[text_col].isin(conflicting_texts)].copy()
+    print(f"🗑️  Baris dibuang (teks identik, rating konflik): {n_before - len(df)}")
+    return df
+
+
 def run_preprocessing(input_path, output_path):
     print(f"📥 Membaca data mentah dari: {input_path}")
     df = pd.read_csv(input_path)
@@ -159,7 +181,9 @@ def run_preprocessing(input_path, output_path):
 
     slang_coverage = compute_slang_coverage(df)
     df = df[df["cleaned_text"].str.strip() != ""]
+    
     n_conflicting = compute_text_rating_conflicts(df)
+    df = drop_text_rating_conflicts(df)          # <-- BARU, sebelum drop_duplicates
     df = df.drop_duplicates(subset=["cleaned_text", "rating"])
 
     final_len = len(df)
@@ -174,7 +198,9 @@ def run_preprocessing(input_path, output_path):
         "text_rating_conflicts": n_conflicting,
         **{f"slang_{k}": v for k, v in slang_coverage.items()},
     }
-    pd.DataFrame([summary]).to_csv(
-        os.path.join(config.RESULTS_DIR, "preprocessing_summary.csv"), index=False
-    )
+    
+    summary_path = os.path.join(config.RESULTS_DIR, f"preprocessing_summary__{config.DATA_VERSION}.csv")
+    pd.DataFrame([summary]).to_csv(summary_path, index=False)
+    print(f"💾 Ringkasan preprocessing -> {summary_path}")
+    
     return df

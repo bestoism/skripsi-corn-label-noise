@@ -10,7 +10,6 @@ IN_COLAB = 'google.colab' in sys.modules
 if IN_COLAB:
     DRIVE_ROOT = '/content/drive/MyDrive/SKRIPSI_CORN'
 else:
-    # Untuk uji coba/debug singkat di lokal (VSCode), tanpa Drive
     DRIVE_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_data")
 
 DATA_RAW_DIR = os.path.join(DRIVE_ROOT, "data", "raw")
@@ -27,64 +26,104 @@ for d in [DATA_RAW_DIR, DATA_PROCESSED_DIR, PROXY_CACHE_DIR, CLEANED_DIR,
     os.makedirs(d, exist_ok=True)
 
 # ==========================================================
-# 2. FILE DATA (SPLIT DIKUNCI — JANGAN DIGENERATE ULANG)
+# 2. FILE DATA -- versioned via set_data_version(), BUKAN assignment langsung
 # ==========================================================
-RAW_DATA_FILE = os.path.join(DATA_RAW_DIR, "all_reviews_master.csv")
-CLEAN_TEXT_FILE = os.path.join(DATA_PROCESSED_DIR, "reviews_clean.csv")
-TRAIN_RAW_FILE = os.path.join(DATA_PROCESSED_DIR, "split_train_raw.csv")
-TEST_FILE = os.path.join(DATA_PROCESSED_DIR, "split_test.csv")
+RAW_DATA_FILE = os.path.join(DATA_RAW_DIR, "all_reviews_master.csv")  # sumber mentah tunggal, tidak versioned
+
+DATA_VERSION = "v2"
+
+def set_data_version(version):
+    """
+    WAJIB dipanggil untuk ganti versi data di tengah sesi -- assignment
+    langsung `config.DATA_VERSION = "v1"` TIDAK mengubah CLEAN_TEXT_FILE/
+    TRAIN_RAW_FILE/TEST_FILE, karena path-path itu perlu dihitung ulang
+    setiap kali versi berubah, tidak cukup sekali saat modul di-import.
+    """
+    global DATA_VERSION, CLEAN_TEXT_FILE, TRAIN_RAW_FILE, TEST_FILE
+    DATA_VERSION = version
+    CLEAN_TEXT_FILE = os.path.join(DATA_PROCESSED_DIR, f"reviews_clean__{DATA_VERSION}.csv")
+    TRAIN_RAW_FILE = os.path.join(DATA_PROCESSED_DIR, f"split_train_raw__{DATA_VERSION}.csv")
+    TEST_FILE = os.path.join(DATA_PROCESSED_DIR, f"split_test__{DATA_VERSION}.csv")
+    print(f"📁 Data version aktif: {DATA_VERSION}")
+
+set_data_version(DATA_VERSION)  # populate path pertama kali saat modul di-import
 
 # ==========================================================
 # 3. REGISTRY PROXY CLASSIFIER — GANTI PROXY DENGAN set_proxy(id)
 # ==========================================================
 PROXY_REGISTRY = {
-    0: {"name": "frozen_cls_lr",        "desc": "CLS embedding beku + Logistic Regression (P1)"},
-    1: {"name": "frozen_meanpool_lr",   "desc": "Mean-pooling embedding beku + Logistic Regression (P2)"},
-    2: {"name": "finetuned_ce",         "desc": "IndoBERT fine-tuned K-Fold, CE loss (P3)"},
-    3: {"name": "finetuned_corn",       "desc": "IndoBERT fine-tuned K-Fold, CORN loss (P4) -- DEFAULT/FINAL"},
-    4: {"name": "finetuned_corn_fusion","desc": "IndoBERT+CORN + fusi sentimen eksternal (P5)"},
+    0: {"name": "frozen_cls_lr", "desc": "CLS embedding beku + LR (P1)",
+        "backbone": "indobenchmark/indobert-base-p1"},
+    1: {"name": "frozen_meanpool_lr", "desc": "Mean-pool embedding beku + LR (P2)",
+        "backbone": "indobenchmark/indobert-base-p1"},
+    2: {"name": "finetuned_ce", "desc": "IndoBERT fine-tuned K-Fold, CE loss (P3)",
+        "backbone": "indobenchmark/indobert-base-p1"},
+    3: {"name": "finetuned_corn", "desc": "IndoBERT fine-tuned K-Fold, CORN loss (P4) -- DEFAULT/FINAL",
+        "backbone": "indobenchmark/indobert-base-p1"},
+    4: {"name": "finetuned_corn_fusion", "desc": "IndoBERT+CORN + fusi sentimen (P5)",
+        "backbone": "indobenchmark/indobert-base-p1"},
+    6: {"name": "finetuned_corn_indobertweet",
+        "desc": "IndoBERTweet fine-tuned K-Fold, CORN loss (P6)",
+        "backbone": "indolem/indobertweet-base-uncased"},
 }
 
 def set_proxy(proxy_id):
     """
     Ganti proxy aktif dengan AMAN di tengah sesi Python -- TANPA
-    importlib.reload(config). reload() berbahaya karena menjalankan ulang
-    SELURUH file config.py dari awal (termasuk nilai default hardcode),
-    me-reset semua path turunan proxy sebelum sempat kamu timpa lagi.
-    Pakai ini di notebook: config.set_proxy(pid)
+    importlib.reload(config). Pakai: config.set_proxy(pid)
     JANGAN pakai: config.PROXY_ID = pid lalu importlib.reload(config)
     """
-    global PROXY_ID, PROXY_NAME, PROXY_DESC
+    global PROXY_ID, PROXY_NAME, PROXY_DESC, PRETRAINED_MODEL_NAME
     global PROXY_PRED_PROBS_FILE, PROXY_PRED_PROBS_META_FILE
     global TRAIN_CLEANED_HARD_FILE, TRAIN_CLEANED_SEVERE_FILE, MODEL_CKPT_DIR
+    global HUMAN_VALIDATION_FILE, HUMAN_VALIDATION_RESULT_FILE
+    global PROGRESS_FILE, NOISE_SAMPLES_FILE
+    global FINAL_RESULTS_TABLE_FILE, SIGNIFICANCE_TEST_FILE
 
     if proxy_id not in PROXY_REGISTRY:
-        raise ValueError(f"PROXY_ID tidak dikenal: {proxy_id} (harus 0-4)")
+        raise ValueError(f"PROXY_ID tidak dikenal: {proxy_id}")
 
+    entry = PROXY_REGISTRY[proxy_id]
     PROXY_ID = proxy_id
-    PROXY_NAME = PROXY_REGISTRY[proxy_id]["name"]
-    PROXY_DESC = PROXY_REGISTRY[proxy_id]["desc"]
+    PROXY_NAME = entry["name"]
+    PROXY_DESC = entry["desc"]
+    PRETRAINED_MODEL_NAME = entry["backbone"]
 
-    PROXY_PRED_PROBS_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs__{PROXY_NAME}.npy")
-    PROXY_PRED_PROBS_META_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs_meta__{PROXY_NAME}.csv")
-    TRAIN_CLEANED_HARD_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_hard__{PROXY_NAME}.csv")
-    TRAIN_CLEANED_SEVERE_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_severe__{PROXY_NAME}.csv")
-    MODEL_CKPT_DIR = os.path.join(MODEL_CKPT_ROOT, PROXY_NAME)
+    tag = f"{PROXY_NAME}__{DATA_VERSION}"  # kunci gabungan proxy+data yang dipakai di semua path turunan
+
+    PROXY_PRED_PROBS_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs__{tag}.npy")
+    PROXY_PRED_PROBS_META_FILE = os.path.join(PROXY_CACHE_DIR, f"oof_pred_probs_meta__{tag}.csv")
+    TRAIN_CLEANED_HARD_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_hard__{tag}.csv")
+    TRAIN_CLEANED_SEVERE_FILE = os.path.join(CLEANED_DIR, f"train_cleaned_severe__{tag}.csv")
+    MODEL_CKPT_DIR = os.path.join(MODEL_CKPT_ROOT, tag)
     os.makedirs(MODEL_CKPT_DIR, exist_ok=True)
 
+    HUMAN_VALIDATION_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_sample__{tag}.csv")
+    HUMAN_VALIDATION_RESULT_FILE = os.path.join(HUMAN_VALIDATION_DIR, f"human_validation_result__{tag}.csv")
+
+    # FIX: sebelumnya statis -- resume Cell 8 dan noise-sample bisa salah
+    # timpa/skip kalau kamu ganti proxy atau data version tanpa restart.
+    PROGRESS_FILE = os.path.join(LOGS_DIR, f"experiment_progress__{tag}.json")
+    NOISE_SAMPLES_FILE = os.path.join(DATA_PROCESSED_DIR, f"detected_noise_samples__{tag}.csv")
+
+    # FIX: hasil akhir Bab 4 sekarang per backbone+data -- retrain dengan
+    # kombinasi berbeda tidak lagi menimpa final_results_table.csv yang sudah jadi.
+    FINAL_RESULTS_TABLE_FILE = os.path.join(RESULTS_DIR, f"final_results_table__{tag}.csv")
+    SIGNIFICANCE_TEST_FILE = os.path.join(RESULTS_DIR, f"significance_test__{tag}.csv")
+
     print(f"📌 Proxy aktif: [{PROXY_ID}] {PROXY_NAME} — {PROXY_DESC}")
+    print(f"   Backbone: {PRETRAINED_MODEL_NAME} | Data: {DATA_VERSION}")
 
 EMBEDDING_CACHE_FILE = os.path.join(PROXY_CACHE_DIR, "embeddings_meanpool.npy")
 EMBEDDING_CACHE_META_FILE = os.path.join(PROXY_CACHE_DIR, "embeddings_meanpool_meta.csv")
 
-PROXY_QUALITY_LOG_FILE = os.path.join(RESULTS_DIR, "proxy_ablation_table.csv")
+PROXY_QUALITY_LOG_FILE = os.path.join(RESULTS_DIR, "proxy_ablation_table.csv")  # tabel akumulatif, tetap satu file
 
-set_proxy(3)   # panggil sekali di sini -- inilah default saat modul di-import pertama kali
+set_proxy(3)   # default saat modul di-import pertama kali
 
 # ==========================================================
 # 4. MODEL & HYPERPARAMETER (SAMA UNTUK SEMUA SKENARIO)
 # ==========================================================
-PRETRAINED_MODEL_NAME = "indobenchmark/indobert-base-p1"
 SENTIMENT_MODEL_NAME = "w11wo/indonesian-roberta-base-sentiment-classifier"  # dipakai hanya jika PROXY_ID == 4
 
 MAX_LEN = 128
@@ -129,13 +168,3 @@ SEVERITY_THRESHOLD = 2
 # 7. VALIDASI MANUSIA
 # ==========================================================
 HUMAN_VALIDATION_N = 50
-HUMAN_VALIDATION_FILE = os.path.join(HUMAN_VALIDATION_DIR, "human_validation_sample.csv")
-HUMAN_VALIDATION_RESULT_FILE = os.path.join(HUMAN_VALIDATION_DIR, "human_validation_result.csv")
-
-# ==========================================================
-# 8. HASIL AKHIR
-# ==========================================================
-FINAL_RESULTS_TABLE_FILE = os.path.join(RESULTS_DIR, "final_results_table.csv")
-SIGNIFICANCE_TEST_FILE = os.path.join(RESULTS_DIR, "significance_test.csv")
-NOISE_SAMPLES_FILE = os.path.join(DATA_PROCESSED_DIR, "detected_noise_samples.csv")
-PROGRESS_FILE = os.path.join(LOGS_DIR, "experiment_progress.json")
