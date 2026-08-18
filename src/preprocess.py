@@ -152,21 +152,48 @@ def compute_text_rating_conflicts(df, text_col="cleaned_text"):
 
 def drop_text_rating_conflicts(df, text_col="cleaned_text"):
     """
-    Buang SEMUA baris yang teksnya identik tapi rating-nya berbeda --
-    ini bukan kandidat noise (yang masih bisa didebat benar/salah),
-    tapi input identik dengan 2 label kontradiktif -- secara matematis
-    unlearnable untuk model apa pun. Kebijakan: buang semua baris
-    yang terlibat, bukan pilih salah satu (tidak ada dasar untuk
-    menentukan mana yang benar). Dokumentasikan di Batasan Penelitian.
+    Untuk teks identik dengan rating berbeda: pertahankan rating MAYORITAS
+    (modus) per grup teks, buang hanya baris yang menyimpang dari mayoritas
+    itu. Lebih moderat dibanding buang seluruh grup -- konsisten dengan
+    filosofi severity-aware (buang yang jelas menyimpang, bukan buang
+    semua yang sekadar ambigu).
+
+    Tie-break: kalau modus tidak unik (mis. 5 baris rating=1 vs 5 baris
+    rating=4, sama banyak), tidak ada dasar objektif memilih salah satu --
+    seluruh grup itu dibuang.
     """
     dup_mask = df.duplicated(subset=[text_col], keep=False)
-    conflict_counts = df[dup_mask].groupby(text_col)["rating"].nunique()
-    conflicting_texts = conflict_counts[conflict_counts > 1].index
+    df_dup = df[dup_mask]
+    df_unique = df[~dup_mask]
 
-    n_before = len(df)
-    df = df[~df[text_col].isin(conflicting_texts)].copy()
-    print(f"🗑️  Baris dibuang (teks identik, rating konflik): {n_before - len(df)}")
-    return df
+    keep_groups = []
+    n_dropped_minority = 0
+    n_dropped_tie = 0
+
+    for text, group in df_dup.groupby(text_col):
+        rating_counts = group["rating"].value_counts()
+        if len(rating_counts) == 1:
+            keep_groups.append(group)  # duplicate teks tapi rating sama semua, bukan konflik
+            continue
+
+        top_count = rating_counts.iloc[0]
+        modes = rating_counts[rating_counts == top_count].index.tolist()
+
+        if len(modes) > 1:
+            n_dropped_tie += len(group)
+            continue  # tie -- buang semua grup ini, tidak ikut disimpan
+
+        majority_rating = modes[0]
+        kept = group[group["rating"] == majority_rating]
+        n_dropped_minority += len(group) - len(kept)
+        keep_groups.append(kept)
+
+    df_result = pd.concat([df_unique] + keep_groups, ignore_index=True) if keep_groups else df_unique
+
+    print(f"🗑️  Baris dibuang (rating minoritas dalam grup konflik): {n_dropped_minority}")
+    print(f"🗑️  Baris dibuang (tie, tidak ada mayoritas jelas): {n_dropped_tie}")
+    print(f"   Total dibuang: {n_dropped_minority + n_dropped_tie}")
+    return df_result
 
 
 def run_preprocessing(input_path, output_path):
