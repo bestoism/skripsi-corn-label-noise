@@ -267,22 +267,25 @@ def _finetune_fusion_kfold_oof(texts, labels):
 # ==========================================================
 def get_proxy_pred_probs(texts, labels):
     """
-    Mengembalikan OOF pred_probs sesuai config.PROXY_ID (0-4).
+    Mengembalikan OOF pred_probs sesuai config.PROXY_ID.
     Ganti proxy cukup ubah config.PROXY_ID -- tidak perlu sentuh file ini.
+    ID valid: 0 (CLS+LR), 1 (mean-pool+LR), 2 (CE), 3 (CORN/IndoBERT),
+    4 (CORN+fusion), 6 (CORN/IndoBERTweet) -- lihat PROXY_REGISTRY di config.py.
     """
     print(f"\n🧮 Menghitung OOF pred_probs — proxy [{config.PROXY_ID}] {config.PROXY_NAME}")
 
-    # Catatan: proxy_id 6 (IndoBERTweet) akan diarahkan ke proxy 3 karena mekanismenya sama
     if config.PROXY_ID == 0:
         return _proxy_frozen_lr(texts, labels, pooling="cls")
     elif config.PROXY_ID == 1:
         return _proxy_frozen_lr(texts, labels, pooling="mean")
     elif config.PROXY_ID in [2, 3, 6]:
-        # Jika proxy 6 (IndoBERTweet) atau 3 (IndoBERT CORN), loss-nya adalah corn
-        # Jika proxy 2, loss-nya adalah ce
+        # proxy_id 3 (IndoBERT+CORN) dan 6 (IndoBERTweet+CORN) memakai kode
+        # fine-tuning yang SAMA (_finetune_kfold_oof) -- backbone-nya berbeda
+        # karena config.PRETRAINED_MODEL_NAME sudah diset oleh set_proxy()
+        # sebelum fungsi ini dipanggil. proxy_id 2 pakai loss CE, bukan CORN.
         loss_type = "corn" if config.PROXY_ID in [3, 6] else "ce"
         return _finetune_kfold_oof(texts, labels, loss_type=loss_type)
     elif config.PROXY_ID == 4:
         return _finetune_fusion_kfold_oof(texts, labels)
     else:
-        raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID}")
+        raise ValueError(f"PROXY_ID tidak dikenal: {config.PROXY_ID} (lihat PROXY_REGISTRY di config.py)")

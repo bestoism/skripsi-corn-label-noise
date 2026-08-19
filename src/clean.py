@@ -46,6 +46,19 @@ def _stratified_human_sample(df_noise, n, seed=42):
 
 def export_human_validation_sample(df_noise, n=None):
     n = n or config.HUMAN_VALIDATION_N
+
+    # PENGAMAN BARU: jangan timpa file yang sudah pernah diisi manual
+    if os.path.exists(config.HUMAN_VALIDATION_FILE):
+        existing = pd.read_csv(config.HUMAN_VALIDATION_FILE)
+        if "human_verdict" in existing.columns:
+            filled = existing["human_verdict"].astype(str).str.strip()
+            n_filled = (~filled.isin(["", "nan"])).sum()
+            if n_filled > 0:
+                print(f"⚠️  {config.HUMAN_VALIDATION_FILE} sudah berisi {n_filled} baris "
+                      f"human_verdict terisi -- TIDAK ditimpa untuk mencegah kehilangan kerja manual.")
+                print("   Hapus file ini manual dulu kalau memang ingin membuat sample baru.")
+                return
+
     sample = _stratified_human_sample(df_noise, n)
     sample = sample[[
         "source_app", "review_text", "cleaned_text",
@@ -156,7 +169,7 @@ def run_confident_learning():
     main_method = "confident_learning"
     df_train["is_noise"] = results[main_method]
     for method, issues in results.items():
-        df_train[f"is_noise__{method}"] = issues
+        df_train[f"is_noise___method"] = issues
 
     df_train["is_noise_severe"] = df_train["is_noise"] & (df_train["rating_diff"] >= config.SEVERITY_THRESHOLD)
 
