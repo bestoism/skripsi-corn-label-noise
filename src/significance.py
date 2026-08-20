@@ -1,3 +1,10 @@
+"""
+significance.py -- Uji signifikansi statistik (Wilcoxon Signed-Rank +
+Holm-Bonferroni) dan effect size (bootstrap CI 95%) untuk 4 hipotesis
+pre-registered (H1-H4), sesuai rumusan masalah Bab 1.3 dan rencana
+pengujian Subbab 3.9.2.
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -13,6 +20,32 @@ from coral_pytorch.dataset import corn_label_from_logits
 
 
 # ==========================================================
+# 0. GUARD -- significance testing HARUS dijalankan dengan proxy final aktif
+# ==========================================================
+# Checkpoint model final (M1-M6) disimpan di config.MODEL_CKPT_DIR, yang
+# path-nya bergantung pada config.PROXY_NAME saat ini (lihat config.set_proxy()).
+# Kalau kamu habis eksplorasi proxy lain (P1-P3, P5) di sesi yang sama dan
+# lupa config.set_proxy(3) sebelum menjalankan modul ini, fungsi di bawah
+# akan mencari checkpoint di folder proxy yang SALAH -- gagalnya jelas
+# (FileNotFoundError), tapi assert eksplisit ini membuat penyebabnya
+# langsung ketahuan dari pesan error, bukan perlu ditelusuri manual dulu.
+_FINAL_PROXY_ID = 3  # finetuned_corn (P4) -- proxy final sesuai Batasan Masalah
+
+
+def _assert_final_proxy_active():
+    if config.PROXY_ID != _FINAL_PROXY_ID:
+        raise RuntimeError(
+            f"Significance testing (M1-M6) harus dijalankan dengan proxy final "
+            f"aktif (PROXY_ID={_FINAL_PROXY_ID}, '{config.PROXY_REGISTRY[_FINAL_PROXY_ID]['name']}'), "
+            f"tapi proxy aktif saat ini adalah PROXY_ID={config.PROXY_ID} "
+            f"('{config.PROXY_NAME}'). Checkpoint model final (M1-M6) hanya disimpan "
+            f"di bawah folder proxy final -- kalau kamu barusan eksplorasi proxy lain "
+            f"(P1-P3, P5) di sesi yang sama, jalankan config.set_proxy({_FINAL_PROXY_ID}) "
+            f"dulu sebelum memanggil fungsi ini."
+        )
+
+
+# ==========================================================
 # 1. KUMPULKAN PREDIKSI DARI KETIGA SEED (bukan cuma seed 42)
 # ==========================================================
 def _get_predictions_one_seed(scenario_name, loss_type, seed, test_loader):
@@ -23,7 +56,9 @@ def _get_predictions_one_seed(scenario_name, loss_type, seed, test_loader):
         raise FileNotFoundError(
             f"Checkpoint tidak ditemukan: {ckpt_path}\n"
             f"Pastikan run_experiment('{scenario_name}', ..., seed={seed}) "
-            f"sudah selesai dijalankan sebelum uji signifikansi."
+            f"sudah selesai dijalankan sebelum uji signifikansi, DAN proxy aktif "
+            f"saat ini ({config.PROXY_NAME}) sama dengan proxy yang dipakai saat "
+            f"training M1-M6 tersebut."
         )
 
     model.load_state_dict(torch.load(ckpt_path, map_location=config.DEVICE))
@@ -44,15 +79,16 @@ def _get_predictions_one_seed(scenario_name, loss_type, seed, test_loader):
 
 def collect_all_predictions(scenarios):
     """
-    Mengumpulkan prediksi test set dari SEMUA seed (bukan cuma seed 42 --
-    ini yang jadi bug di versi lama, padahal Bab 3 (Subbab 3.9.2) menjanjikan
-    uji Wilcoxon dihitung dari rata-rata absolute error yang diagregasi dari
-    tiga random seed, bukan dari satu seed saja).
+    Mengumpulkan prediksi test set dari SEMUA seed (bukan cuma seed 42),
+    sesuai Subbab 3.9.2: uji Wilcoxon dihitung dari rata-rata absolute
+    error yang diagregasi dari tiga random seed.
 
     Return:
         true_labels: array label test set asli (skala 1-5)
         preds_per_seed: dict {scenario_name: {seed: array_prediksi}}
     """
+    _assert_final_proxy_active()
+
     df_test = pd.read_csv(config.TEST_FILE)
     test_loader = DataLoader(
         ReviewDataset(df_test["cleaned_text"].tolist(), df_test["rating"].tolist()),
@@ -80,40 +116,52 @@ def aggregate_errors_across_seeds(true_labels, preds_per_seed):
     Untuk tiap skenario, hitung absolute error per sampel PER SEED, lalu
     rata-ratakan across seed (bukan across sampel!) -- sehingga tiap sampel
     test set punya satu nilai error yang mewakili konsistensi model di
-    3 inisialisasi bobot berbeda. Ini persis yang dijanjikan di Subbab 3.9.2
-    proposal: "rata-rata absolute error per sampel data uji yang diagregasi
-    dari tiga random seed".
+    3 inisialisasi bobot berbeda. Sesuai Subbab 3.9.2: "rata-rata absolute
+    error per sampel data uji yang diagregasi dari tiga random seed".
 
     Return: dict {scenario_name: array shape (n_test_samples,)}
     """
     aggregated = {}
     for scenario_name, seed_preds in preds_per_seed.items():
-        # shape: (n_seed, n_test_samples)
         errors_per_seed = np.stack([
             np.abs(true_labels - preds) for preds in seed_preds.values()
         ])
-        aggregated[scenario_name] = errors_per_seed.mean(axis=0)  # rata-rata across seed
+        aggregated[scenario_name] = errors_per_seed.mean(axis=0)
     return aggregated
 
 
 # ==========================================================
-# 3. UJI SIGNIFIKANSI — HANYA 3 HIPOTESIS PRE-REGISTERED
+# 3. UJI SIGNIFIKANSI — 4 HIPOTESIS PRE-REGISTERED
 # ==========================================================
-# Sesuai Subbab 3.9.2 proposal: dibatasi pada 3 perbandingan agar koreksi
-# multiple comparison tidak berlebihan menghukum daya uji (dibanding menguji
-# seluruh 15 kombinasi pasangan dari 6 skenario sekaligus).
+# H4 DITAMBAHKAN (M6 vs M5): rumusan masalah Bab 1.3 secara eksplisit
+# menanyakan "Apakah strategi severity-aware pruning ... memberikan manfaat
+# performa yang signifikan secara statistik dibandingkan baseline TANPA
+# CLEANING DAN DIBANDINGKAN HARD-PRUNING" -- H1-H3 sebelumnya hanya
+# menjawab bagian "dibandingkan baseline" (lewat H2: M6 vs M4) dan
+# "hard-prune vs baseline" (H3: M5 vs M4), tapi TIDAK PERNAH membandingkan
+# M6 vs M5 secara langsung -- padahal itu perbandingan paling langsung
+# menjawab "severity-aware LEBIH BAIK DARI hard-pruning atau tidak", bukan
+# disimpulkan secara tidak langsung dari selisih H2 dan H3 terhadap
+# baseline yang sama (itu bisa menyesatkan -- signifikan/tidaknya H2 dan H3
+# terhadap M4 TIDAK OTOMATIS memberi tahu apakah M6 signifikan berbeda dari
+# M5 sendiri, karena keduanya dibandingkan ke pembanding yang berbeda arah
+# variansnya).
 PRE_REGISTERED_HYPOTHESES = [
-    ("H1_CORN_vs_CE_raw",        "M4_Baseline_CORN",      "M1_Baseline_CE"),
-    ("H2_SeverityAware_vs_Base", "M6_CleanedSevere_CORN", "M4_Baseline_CORN"),
-    ("H3_HardPrune_vs_Base",     "M5_CleanedHard_CORN",   "M4_Baseline_CORN"),
+    ("H1_CORN_vs_CE_raw",         "M4_Baseline_CORN",      "M1_Baseline_CE"),
+    ("H2_SeverityAware_vs_Base",  "M6_CleanedSevere_CORN", "M4_Baseline_CORN"),
+    ("H3_HardPrune_vs_Base",      "M5_CleanedHard_CORN",   "M4_Baseline_CORN"),
+    ("H4_SeverityAware_vs_Hard",  "M6_CleanedSevere_CORN", "M5_CleanedHard_CORN"),
 ]
 
 
 def run_significance_test(aggregated_errors, alpha=0.05):
     """
-    Wilcoxon Signed-Rank per hipotesis pre-registered, dikoreksi bersama
-    dengan Holm-Bonferroni (bukan per-uji terpisah -- koreksi harus menghitung
-    SEMUA uji yang dilakukan dalam satu keluarga hipotesis sekaligus).
+    Wilcoxon Signed-Rank per hipotesis pre-registered (sekarang 4, bukan 3),
+    dikoreksi BERSAMA dengan Holm-Bonferroni -- koreksi otomatis menghitung
+    SEMUA uji yang didaftarkan di PRE_REGISTERED_HYPOTHESES (multipletests
+    menerima daftar p-value apa adanya, jadi menambah H4 ke daftar di atas
+    sudah cukup untuk membuat koreksi berbasis 4 uji, tidak perlu ubah kode
+    di bawah ini).
     """
     raw_pvalues = []
     rows = []
@@ -150,7 +198,7 @@ def run_significance_test(aggregated_errors, alpha=0.05):
 
     results_df = pd.DataFrame(rows)
     results_df.to_csv(config.SIGNIFICANCE_TEST_FILE, index=False)
-    print(f"\n💾 Hasil uji signifikansi -> {config.SIGNIFICANCE_TEST_FILE}")
+    print(f"\n💾 Hasil uji signifikansi (4 hipotesis, Holm-Bonferroni) -> {config.SIGNIFICANCE_TEST_FILE}")
 
     return results_df
 
@@ -161,9 +209,9 @@ def run_significance_test(aggregated_errors, alpha=0.05):
 def bootstrap_effect_size(aggregated_errors, model_a, model_b, n_boot=2000, seed=42):
     """
     Selisih mean error (model_a - model_b) + interval kepercayaan 95% lewat
-    bootstrap resampling pada data uji -- sesuai Subbab 3.9.2: dilaporkan
-    meski hasil tidak signifikan, supaya besaran efek tetap terlihat,
-    bukan diabaikan begitu saja.
+    bootstrap resampling pada data uji -- dilaporkan meski hasil tidak
+    signifikan, supaya besaran efek tetap terlihat, bukan diabaikan begitu
+    saja (Subbab 3.9.2).
     """
     rng = np.random.default_rng(seed)
     errors_a = aggregated_errors[model_a]

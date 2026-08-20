@@ -1,7 +1,14 @@
+"""
+clean.py -- Pipeline Confident Learning untuk deteksi label noise.
+Satu skema data (tanpa versioning v1/v2) -- all_reviews_master.csv adalah
+sumber kebenaran tunggal, dikunci sejak awal.
+"""
+
 import os
 import numpy as np
 import pandas as pd
 import cleanlab
+from cleanlab.count import num_label_issues
 from sklearn.model_selection import train_test_split
 
 from src import config
@@ -46,19 +53,6 @@ def _stratified_human_sample(df_noise, n, seed=42):
 
 def export_human_validation_sample(df_noise, n=None):
     n = n or config.HUMAN_VALIDATION_N
-
-    # PENGAMAN BARU: jangan timpa file yang sudah pernah diisi manual
-    if os.path.exists(config.HUMAN_VALIDATION_FILE):
-        existing = pd.read_csv(config.HUMAN_VALIDATION_FILE)
-        if "human_verdict" in existing.columns:
-            filled = existing["human_verdict"].astype(str).str.strip()
-            n_filled = (~filled.isin(["", "nan"])).sum()
-            if n_filled > 0:
-                print(f"⚠️  {config.HUMAN_VALIDATION_FILE} sudah berisi {n_filled} baris "
-                      f"human_verdict terisi -- TIDAK ditimpa untuk mencegah kehilangan kerja manual.")
-                print("   Hapus file ini manual dulu kalau memang ingin membuat sample baru.")
-                return
-
     sample = _stratified_human_sample(df_noise, n)
     sample = sample[[
         "source_app", "review_text", "cleaned_text",
@@ -75,52 +69,87 @@ def export_human_validation_sample(df_noise, n=None):
 
 
 # ==========================================================
-# 2. LOG KUALITAS PROXY — akumulatif, idempotent per (proxy_id, data_version)
+# 2. LOG KUALITAS PROXY — akumulatif, idempotent per proxy_id
 # ==========================================================
-def _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged):
+def _log_proxy_quality(proxy_metrics, pct_flagged, selected_method, method_selection_info):
     """
-    Satu baris per (proxy_id, data_version) di results/proxy_ablation_table.csv.
-    Idempotent: kalau clean.py dijalankan ulang dengan kombinasi proxy+data
-    yang sama, baris lama diganti -- bukan duplikat. Kombinasi BERBEDA
-    (mis. P4 di data v1 vs v2) tetap berdampingan, tidak saling menimpa --
-    ini yang sebelumnya bug karena kunci dedup cuma proxy_id.
+    Satu baris per proxy_id di results/proxy_ablation_table.csv (dipakai
+    untuk pilot study Bab 1). Idempotent: kalau clean.py dijalankan ulang
+    dengan PROXY_ID yang sama, baris lama diganti -- bukan duplikat.
     """
     row = {
         "proxy_id": config.PROXY_ID,
         "proxy_name": config.PROXY_NAME,
         "proxy_desc": config.PROXY_DESC,
-        "data_version": config.DATA_VERSION,
-        "accuracy": proxy_acc,
+        "accuracy": proxy_metrics["accuracy"],
         "mae": proxy_metrics["mae"],
         "off_by_one": proxy_metrics["off_by_one"],
         "qwk": proxy_metrics["qwk"],
         "pct_flagged_noise": pct_flagged,
+        "selected_filter_method": selected_method,
+        "n_issues_confident_learning": method_selection_info["confident_learning"],
+        "n_issues_prune_by_noise_rate": method_selection_info["prune_by_noise_rate"],
+        "n_issues_estimated_theoretical": method_selection_info["estimated_theoretical"],
     }
     log_df = pd.DataFrame([row])
 
     if os.path.exists(config.PROXY_QUALITY_LOG_FILE):
         existing = pd.read_csv(config.PROXY_QUALITY_LOG_FILE)
-        if "data_version" not in existing.columns:
-            existing["data_version"] = "v1"  # baris lama sebelum kolom ini ada
-        existing = existing[
-            ~((existing["proxy_id"] == config.PROXY_ID) &
-              (existing["data_version"] == config.DATA_VERSION))
-        ]
-        log_df = pd.concat([existing, log_df], ignore_index=True).sort_values(
-            ["data_version", "proxy_id"]
-        )
+        existing = existing[existing["proxy_id"] != config.PROXY_ID]
+        log_df = pd.concat([existing, log_df], ignore_index=True).sort_values("proxy_id")
 
     log_df.to_csv(config.PROXY_QUALITY_LOG_FILE, index=False)
     print(f"📄 Tabel ablasi proxy diperbarui -> {config.PROXY_QUALITY_LOG_FILE}")
 
 
 # ==========================================================
-# 3. PIPELINE UTAMA CONFIDENT LEARNING
+# 3. PEMILIHAN METODE FILTER — kriteria eksplisit, bukan hardcode
+# ==========================================================
+def _select_filter_method(labels, pred_probs, results):
+    """
+    cleanlab menyediakan dua cara berbeda untuk "tahu" ada berapa banyak
+    label issue di data:
+    1. num_label_issues() -- estimasi TEORETIS jumlah label issue dari trace
+       confident joint yang sudah dikalibrasi (Northcutt dkk., 2021, Sec. 3-4),
+       TIDAK bergantung pada filter_by manapun.
+    2. Metode filter aktual (confident_learning, prune_by_noise_rate) --
+       masing-masing punya heuristik berbeda untuk MEMILIH baris mana saja
+       yang diflag, sehingga jumlah barisnya bisa berbeda dari estimasi (1).
+
+    Kriteria pemilihan di sini: pilih metode filter yang jumlah baris
+    flag-nya PALING DEKAT dengan estimasi teoretis num_label_issues().
+    Rasionalnya -- num_label_issues() adalah estimasi paling langsung dari
+    "berapa banyak yang seharusnya salah" menurut kerangka CL, jadi metode
+    filter yang paling mendekati angka itu dianggap paling representatif
+    untuk dataset ini. Ini kriteria eksplisit dan reproducible, bukan
+    preferensi pribadi terhadap satu metode filter.
+
+    CATATAN UNTUK BAB III/IV: kriteria ini adalah satu pilihan yang masuk
+    akal, bukan satu-satunya yang valid -- sebutkan eksplisit di metodologi
+    bahwa ini keputusan desain, dan laporkan angka ketiganya (lihat kolom
+    n_issues_* di proxy_ablation_table.csv) supaya pembaca bisa menilai
+    sendiri seberapa jauh selisihnya.
+    """
+    estimated_n = int(num_label_issues(labels=labels, pred_probs=pred_probs))
+
+    counts = {method: int(issues.sum()) for method, issues in results.items()}
+    selected_method = min(counts, key=lambda m: abs(counts[m] - estimated_n))
+
+    print(f"\n🎯 Pemilihan metode filter (kriteria: paling dekat dengan estimasi teoretis):")
+    print(f"   Estimasi teoretis (num_label_issues)  : {estimated_n} baris")
+    for method, n in counts.items():
+        marker = " <-- DIPILIH" if method == selected_method else ""
+        print(f"   '{method}': {n} baris (selisih: {abs(n - estimated_n)}){marker}")
+
+    return selected_method, {**counts, "estimated_theoretical": estimated_n}
+
+
+# ==========================================================
+# 4. PIPELINE UTAMA CONFIDENT LEARNING
 # ==========================================================
 def run_confident_learning():
     print("=" * 60)
-    print(f" CONFIDENT LEARNING — proxy aktif: [{config.PROXY_ID}] {config.PROXY_NAME} "
-          f"| data: {config.DATA_VERSION} ")
+    print(f" CONFIDENT LEARNING — proxy aktif: [{config.PROXY_ID}] {config.PROXY_NAME} ")
     print("=" * 60)
 
     df_train = pd.read_csv(config.TRAIN_RAW_FILE)
@@ -136,6 +165,7 @@ def run_confident_learning():
     labels = df_train["rating"].values - 1  # 0-indexed
     texts = df_train["cleaned_text"].tolist()
 
+    # ---- INTEGRASI DENGAN proxy.py: satu panggilan, tidak perduli metodenya ----
     pred_probs = get_proxy_pred_probs(texts, labels)
 
     if pred_probs.shape != (len(texts), config.NUM_CLASSES):
@@ -146,11 +176,13 @@ def run_confident_learning():
         )
 
     proxy_preds = np.argmax(pred_probs, axis=1)
-    proxy_acc = (proxy_preds == labels).mean()
+    # proxy_metrics["accuracy"] adalah satu-satunya sumber exact accuracy --
+    # sebelumnya dihitung dua kali terpisah (proxy_acc manual + compute_metrics),
+    # redundan dan berisiko dua angka beda kalau salah satu diedit nanti.
     proxy_metrics = compute_metrics(labels, proxy_preds)
 
-    print(f"\n📐 Kualitas proxy [{config.PROXY_NAME}] (data {config.DATA_VERSION}):")
-    print(f"   Exact Accuracy : {proxy_acc:.4f}")
+    print(f"\n📐 Kualitas proxy [{config.PROXY_NAME}]:")
+    print(f"   Exact Accuracy : {proxy_metrics['accuracy']:.4f}")
     print(f"   MAE            : {proxy_metrics['mae']:.4f}")
     print(f"   Off-by-1 Acc   : {proxy_metrics['off_by_one']:.4f}")
     print(f"   QWK            : {proxy_metrics['qwk']:.4f}")
@@ -159,17 +191,32 @@ def run_confident_learning():
     df_train["predicted_rating"] = proxy_preds + 1
     df_train["rating_diff"] = (df_train["rating"] - df_train["predicted_rating"]).abs()
 
+    # ---- filter cleanlab, >=2 metode dihitung, lalu dipilih via kriteria eksplisit ----
+    # min_examples_per_class dipasang eksplisit: tanpa ini, kelas minoritas
+    # (rating 2/3) berisiko diperlakukan tidak stabil oleh cleanlab saat
+    # mengestimasi confident joint per kelas (lihat dokumentasi cleanlab
+    # soal galat estimasi pada kelas kecil). Nilai 20 dipilih sebagai batas
+    # bawah kasar -- laporkan di Bab IV kalau ada kelas yang jumlahnya
+    # mendekati batas ini di data train.
+    MIN_EXAMPLES_PER_CLASS = 20
+
     results = {}
     print("\n🔎 Analisis Metode Filter Cleanlab:")
     for method in config.CLEANLAB_FILTER_METHODS:
-        issues = cleanlab.filter.find_label_issues(labels=labels, pred_probs=pred_probs, filter_by=method)
+        issues = cleanlab.filter.find_label_issues(
+            labels=labels,
+            pred_probs=pred_probs,
+            filter_by=method,
+            min_examples_per_class=MIN_EXAMPLES_PER_CLASS,
+        )
         results[method] = issues
         print(f"   '{method}': {issues.sum()} baris diflag ({issues.sum()/len(df_train)*100:.2f}%)")
 
-    main_method = "confident_learning"
-    df_train["is_noise"] = results[main_method]
+    selected_method, method_selection_info = _select_filter_method(labels, pred_probs, results)
+
+    df_train["is_noise"] = results[selected_method]
     for method, issues in results.items():
-        df_train[f"is_noise___method"] = issues
+        df_train[f"is_noise__{method}"] = issues
 
     df_train["is_noise_severe"] = df_train["is_noise"] & (df_train["rating_diff"] >= config.SEVERITY_THRESHOLD)
 
@@ -177,13 +224,18 @@ def run_confident_learning():
     df_cleaned_severe = df_train[~df_train["is_noise_severe"]].copy()
     df_noise = df_train[df_train["is_noise"]].copy()
 
-    print(f"\n✅ Deteksi selesai (metode utama: {main_method}).")
+    print(f"\n✅ Deteksi selesai (metode terpilih: {selected_method}).")
     print(f"   Hard-prune     : buang {len(df_noise)} / sisa {len(df_cleaned_hard)}")
     print(f"   Severity-aware : buang {df_train['is_noise_severe'].sum()} / sisa {len(df_cleaned_severe)}")
     print("\n📊 Distribusi rating_diff pada baris noise:")
     print(df_noise["rating_diff"].value_counts().sort_index())
 
-    _log_proxy_quality(proxy_acc, proxy_metrics, pct_flagged=len(df_noise) / len(df_train) * 100)
+    _log_proxy_quality(
+        proxy_metrics,
+        pct_flagged=len(df_noise) / len(df_train) * 100,
+        selected_method=selected_method,
+        method_selection_info=method_selection_info,
+    )
 
     drop_cols = [c for c in df_cleaned_hard.columns
                  if c.startswith("is_noise") or c in ("predicted_rating", "rating_diff")]

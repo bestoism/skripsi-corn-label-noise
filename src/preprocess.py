@@ -1,3 +1,15 @@
+"""
+preprocess.py -- Praproses teks ulasan untuk fine-tuning IndoBERT.
+Preprocessing dijaga minimal (tanpa stemming/stopword removal) sesuai
+rekomendasi Wilie dkk. (2020, IndoNLU) dan Koto dkk. (2020, IndoLEM/IndoBERT)
+untuk model berbasis BERT.
+
+CATATAN: filter bahasa (Indonesia vs lainnya) sudah dilakukan di tahap
+scraping (scrape_google_play.py, kolom detected_lang) -- modul ini TIDAK
+mengulang filter bahasa, hanya membawa kolom detected_lang apa adanya
+untuk keperluan audit.
+"""
+
 import os
 import re
 import urllib.request
@@ -7,12 +19,55 @@ from src import config
 # ==========================================================
 # KAMUS EMOJI -> SENTIMEN
 # ==========================================================
+# Diperluas dari versi sebelumnya (~12 entri) -- proposal menyatakan emoji
+# diterjemahkan karena "umumnya tidak tercakup vocabulary WordPiece IndoBERT",
+# jadi cakupannya perlu mendekati emoji yang benar-benar sering muncul di
+# ulasan app store (bukan cuma subset kecil yang kebetulan terpikirkan).
 EMOJI_SENTIMENT = {
-    "😭": " sedih ", "😢": " sedih ", "😔": " kecewa ",
-    "😡": " marah ", "🤬": " marah ", "😤": " kesal ",
-    "😍": " suka ", "❤️": " suka ", "👍": " bagus ",
-    "😊": " senang ", "🙏": " terima_kasih ", "👎": " buruk ",
+    # Sedih / kecewa
+    "😭": " sedih ", "😢": " sedih ", "😔": " kecewa ", "😞": " kecewa ",
+    "😟": " khawatir ", "😩": " lelah ", "😫": " lelah ", "😖": " kesal ",
+    "☹️": " sedih ", "🙁": " sedih ", "💔": " kecewa ",
+    # Marah / kesal
+    "😡": " marah ", "🤬": " marah ", "😤": " kesal ", "😑": " kesal ",
+    "😠": " marah ", "👊": " marah ", "🙄": " kesal ",
+    # Suka / senang / positif
+    "😍": " suka ", "❤️": " suka ", "🧡": " suka ", "💛": " suka ",
+    "💚": " suka ", "💙": " suka ", "💜": " suka ", "🖤": " suka ",
+    "🤍": " suka ", "🤎": " suka ", "😊": " senang ", "😁": " senang ",
+    "😆": " senang ", "🥰": " suka ", "😘": " suka ", "🙌": " senang ",
+    "🎉": " senang ", "🎊": " senang ", "✨": " bagus ", "🔥": " bagus ",
+    "💯": " bagus ", "👏": " bagus ", "👌": " bagus ", "💪": " semangat ",
+    "🤝": " terima_kasih ", "😂": " lucu ", "🤣": " lucu ",
+    # Terima kasih / hormat
+    "🙏": " terima_kasih ",
+    # Baik / buruk (evaluatif langsung)
+    "👍": " bagus ", "👎": " buruk ",
+    # Terkejut
+    "😱": " kaget ", "😨": " takut ", "😰": " cemas ",
+    # Bingung / ragu
+    "😅": " canggung ", "😉": " bercanda ", "😜": " bercanda ",
+    "🤔": " bingung ", "😐": " biasa_saja ",
 }
+
+# Setelah translasi, emoji yang TIDAK ada di kamus di atas (bukan berarti
+# jarang -- kamus manapun selalu punya batas) di-STRIP (dihapus), bukan
+# dibiarkan lolos mentah ke tokenizer. Emoji mentah yang lolos berisiko
+# jadi token [UNK] atau residu aneh di WordPiece IndoBERT -- lebih aman
+# dihapus (netral) daripada dibiarkan mengotori teks tanpa makna yang jelas.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"  # simbol & piktograf (termasuk emoticon, transport, dll.)
+    "\U00002600-\U000027BF"  # simbol lain (mis. ☹️, ✨, ❤️ sebelum variation selector)
+    "\U0001F1E6-\U0001F1FF"  # bendera (regional indicator symbols)
+    "\U00002700-\U000027BF"
+    "\U0001F900-\U0001F9FF"
+    "\U00002190-\U000021FF"  # panah (jarang tapi jaga-jaga)
+    "\U0000FE0F"             # variation selector (ekor emoji, mis. di ❤️)
+    "]+",
+    flags=re.UNICODE,
+)
+
 
 # ==========================================================
 # KAMUS SLANG — DIUNDUH OTOMATIS, DI-CACHE LOKAL
@@ -25,18 +80,13 @@ LEXICON_DIR = os.path.join(config.DRIVE_ROOT, "lexicon")
 SLANG_BASE_PATH = os.path.join(LEXICON_DIR, "slang_base.csv")
 SLANG_DOMAIN_PATH = os.path.join(LEXICON_DIR, "slang_domain.csv")
 
+REQUIRED_SLANG_COLUMNS = ["slang", "formal"]
+
 
 def _download_kamus_alay():
     """
     Unduh Kamus Alay (Salsabila dkk., 2018) sekali, simpan cache lokal di
     Drive supaya run berikutnya tidak perlu akses internet lagi.
-
-    Rujukan efektivitas untuk IndoBERT (dikutip di Bab 3):
-    - Bustamin dkk. (2025), ICIC Express Letters Part B, 16(2): normalisasi
-      slang + Levenshtein sebelum IndoBERT menaikkan akurasi 3.47%.
-    - Studi ablasi preprocessing IndoBERT (JCTA, 2025/2026): normalisasi
-      slang adalah langkah preprocessing tunggal paling berpengaruh
-      (macro F1 +0.0609 dibanding tanpa preprocessing).
     """
     os.makedirs(LEXICON_DIR, exist_ok=True)
 
@@ -52,32 +102,56 @@ def _download_kamus_alay():
         print("   Normalisasi slang dasar akan dilewati (hanya pakai kamus domain jika ada).")
 
 
+def _validate_slang_columns(df, source_path):
+    """
+    Validasi eksplisit setelah membaca file kamus -- kalau URL sumber
+    berubah format (Kamus Alay punya beberapa versi dengan jumlah/nama
+    kolom berbeda), pd.read_csv(usecols=...) akan KeyError dengan pesan
+    generik yang tidak menunjukkan ke mana harus dicek. Validasi ini
+    menggantinya dengan pesan yang eksplisit menunjuk file dan kolom yang
+    bermasalah, supaya tidak perlu debug dari traceback pandas mentah.
+    """
+    missing = [c for c in REQUIRED_SLANG_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Kamus slang di '{source_path}' tidak punya kolom yang diharapkan: "
+            f"{missing}. Kolom yang tersedia di file ini: {df.columns.tolist()}. "
+            f"Kemungkinan format sumber Kamus Alay berubah -- cek URL "
+            f"({KAMUS_ALAY_URL}) secara manual dan sesuaikan REQUIRED_SLANG_COLUMNS "
+            f"atau mapping kolom di _load_slang_lexicon()."
+        )
+
+
 def _load_slang_lexicon():
     """
     Memuat & menggabungkan dua sumber kamus slang:
-    1. slang_base.csv   -- Kamus Alay (diunduh otomatis, ~3592 entri, tidak
-                            perlu kamu siapkan manual)
+    1. slang_base.csv   -- Kamus Alay (diunduh otomatis), dengan header asli
+                            (slang, formal, in-dictionary, context, category1-3)
     2. slang_domain.csv -- opsional, entri khusus domain ulasan aplikasi yang
-                            TIDAK tercakup Kamus Alay (mis. 'tokped'->
-                            'tokopedia', 'cs'->'customer service'). Kalau file
-                            ini tidak ada, dilewati saja, tidak error.
+                            TIDAK tercakup Kamus Alay. Kalau file ini tidak
+                            ada, dilewati saja, tidak error.
     """
     _download_kamus_alay()
     lexicon = {}
 
     if os.path.exists(SLANG_BASE_PATH):
-        # FIX: file aslinya punya 7 kolom (slang,formal,In-dictionary,context,
-        # category1,category2,category3) DENGAN header. usecols otomatis pakai
-        # header bawaan file dan ambil kolom yang benar berdasarkan NAMA,
-        # bukan posisi -- aman walau urutan/jumlah kolom sumber berubah.
-        df_base = pd.read_csv(SLANG_BASE_PATH, usecols=["slang", "formal"])
+        try:
+            df_base = pd.read_csv(SLANG_BASE_PATH, usecols=REQUIRED_SLANG_COLUMNS)
+        except ValueError as e:
+            # usecols gagal cocok dengan kolom aktual -- baca tanpa usecols
+            # dulu supaya bisa kasih pesan error yang jelas via _validate_slang_columns
+            df_base = pd.read_csv(SLANG_BASE_PATH)
+            _validate_slang_columns(df_base, SLANG_BASE_PATH)
+            df_base = df_base[REQUIRED_SLANG_COLUMNS]
+
         lexicon.update(dict(zip(df_base["slang"], df_base["formal"])))
         print(f"📖 Kamus slang dasar: {len(df_base)} entri (Salsabila dkk., 2018)")
     else:
         print("⚠️ Kamus slang dasar tidak tersedia -- normalisasi slang dilewati.")
 
     if os.path.exists(SLANG_DOMAIN_PATH):
-        df_domain = pd.read_csv(SLANG_DOMAIN_PATH)  # kolom: slang, formal (dengan header)
+        df_domain = pd.read_csv(SLANG_DOMAIN_PATH)
+        _validate_slang_columns(df_domain, SLANG_DOMAIN_PATH)
         n_before = len(lexicon)
         lexicon.update(dict(zip(df_domain["slang"], df_domain["formal"])))
         print(f"📖 Kamus slang domain: {len(df_domain)} entri "
@@ -98,14 +172,49 @@ def replace_emoji_sentiment(text):
     return text
 
 
+def strip_unrecognized_emoji(text):
+    """Hapus emoji yang tidak tercakup EMOJI_SENTIMENT (dipanggil SETELAH
+    replace_emoji_sentiment, supaya emoji yang sudah dikenal & diterjemahkan
+    tidak ikut terhapus di sini -- hanya sisa residu yang belum tertangani)."""
+    return _EMOJI_PATTERN.sub(" ", text)
+
+
+_WORD_STRIP_PATTERN = re.compile(r'^(\W*)(\w+)(\W*)$', flags=re.UNICODE)
+
+
+def _normalize_word_with_slang(word):
+    """
+    PERBAIKAN dari versi sebelumnya: text.split() sebelumnya dipanggil pada
+    teks yang tanda bacanya belum dipisah dari kata (mis. "gpp," atau
+    "yah!"), sehingga token seperti itu TIDAK PERNAH cocok dengan entri
+    kamus ("gpp", "yah") -- cakupan normalisasi riil jauh di bawah yang
+    dilaporkan compute_slang_coverage() (yang menghitung dari raw text
+    dengan cara strip berbeda).
+
+    Fix: untuk tiap token, pisahkan dulu tanda baca di PINGGIR kata (bukan
+    di tengah, supaya tidak merusak kata majemuk berstrip/underscore) dari
+    inti kata. Cari inti kata itu di kamus. Kalau cocok, ganti HANYA inti
+    katanya, tanda baca di pinggir tetap dipertahankan apa adanya (sesuai
+    prinsip preprocessing minimal -- kita tidak menghapus tanda baca,
+    cukup memperbaiki pencarian kamus supaya tidak buta terhadap tanda
+    baca yang menempel).
+    """
+    match = _WORD_STRIP_PATTERN.match(word)
+    if not match:
+        return word  # token tanpa karakter alfanumerik sama sekali (jarang)
+
+    prefix, core, suffix = match.groups()
+    normalized_core = SLANG_DICT.get(core, core)
+    return f"{prefix}{normalized_core}{suffix}"
+
+
 def clean_text_for_bert(text):
     """
     Preprocessing minimal untuk model berbasis BERT (lihat rujukan Wilie dkk.
     2020 IndoNLU; Koto dkk. 2020 IndoLEM/IndoBERT): TANPA stemming/stopword
     removal. Normalisasi slang tetap dilakukan karena divalidasi berulang
     kali sebagai langkah preprocessing paling berpengaruh untuk fine-tuning
-    IndoBERT pada teks informal (Bustamin dkk., 2025; studi ablasi JCTA
-    2025/2026).
+    IndoBERT pada teks informal (Bustamin dkk., 2025).
     """
     if not isinstance(text, str):
         return ""
@@ -113,13 +222,16 @@ def clean_text_for_bert(text):
     text = text.lower()  # wajib -- indobert-base-p1 adalah model uncased
     text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
     text = re.sub(r'@\w+', '', text)
+
     text = replace_emoji_sentiment(text)
+    text = strip_unrecognized_emoji(text)
+
     text = re.sub(r'(.)\1{2,}', r'\1\1', text)
     text = re.sub(r'([!?.,])\1+', r'\1', text)
 
     if SLANG_DICT:
         words = text.split()
-        text = ' '.join(SLANG_DICT.get(w, w) for w in words)
+        text = ' '.join(_normalize_word_with_slang(w) for w in words)
 
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -129,6 +241,14 @@ def clean_text_for_bert(text):
 # FUNGSI ANALITIK & PIPELINE UTAMA
 # ==========================================================
 def compute_slang_coverage(df, raw_col="review_text"):
+    """
+    CATATAN: fungsi ini menghitung cakupan dari RAW TEXT dengan cara strip
+    sendiri (re.sub kasar), BUKAN dari hasil clean_text_for_bert() -- jadi
+    angka di sini adalah estimasi kasar "berapa kata yang secara teori bisa
+    ternormalisasi", bukan angka final setelah pipeline lengkap. Untuk
+    audit yang presisi terhadap bug pinggir-tanda-baca yang baru diperbaiki,
+    bandingkan manual beberapa baris cleaned_text sebelum/sesudah fix ini.
+    """
     all_words = ' '.join(df[raw_col].dropna().astype(str).str.lower()).split()
     total = len(all_words)
     cleaned_words = [re.sub(r'[^a-z0-9]', '', w) for w in all_words]
@@ -138,8 +258,27 @@ def compute_slang_coverage(df, raw_col="review_text"):
         "normalized_words": matched,
         "coverage_pct": round(matched / total * 100, 2) if total > 0 else 0.0,
     }
-    print(f"📊 Cakupan kamus slang: {matched}/{total} kata ({coverage['coverage_pct']}%)")
+    print(f"📊 Cakupan kamus slang (estimasi dari raw text): {matched}/{total} kata ({coverage['coverage_pct']}%)")
     return coverage
+
+
+def compute_text_length_distribution(df, text_col="cleaned_text", min_words=3):
+    """
+    Laporan panjang teks (dalam kata) -- TIDAK memfilter otomatis (ulasan
+    pendek bukan berarti label salah, cuma minim sinyal tekstual). Kolom
+    'is_very_short' ditambahkan sebagai PENANDA, bukan alasan pembuangan,
+    supaya nanti saat menganalisis noise di Bab IV bisa dibedakan: baris
+    yang diflag CL karena teksnya memang minim informasi (bukan mismatch
+    rating-teks yang sesungguhnya) vs baris yang benar-benar noise.
+    """
+    word_counts = df[text_col].astype(str).str.split().apply(len)
+    is_very_short = word_counts <= min_words
+    pct_very_short = is_very_short.mean() * 100
+
+    print(f"📏 Distribusi panjang teks: median={word_counts.median():.0f} kata, "
+          f"ulasan sangat pendek (<={min_words} kata): {pct_very_short:.2f}%")
+
+    return word_counts, is_very_short
 
 
 def compute_text_rating_conflicts(df, text_col="cleaned_text"):
@@ -154,13 +293,8 @@ def drop_text_rating_conflicts(df, text_col="cleaned_text"):
     """
     Untuk teks identik dengan rating berbeda: pertahankan rating MAYORITAS
     (modus) per grup teks, buang hanya baris yang menyimpang dari mayoritas
-    itu. Lebih moderat dibanding buang seluruh grup -- konsisten dengan
-    filosofi severity-aware (buang yang jelas menyimpang, bukan buang
-    semua yang sekadar ambigu).
-
-    Tie-break: kalau modus tidak unik (mis. 5 baris rating=1 vs 5 baris
-    rating=4, sama banyak), tidak ada dasar objektif memilih salah satu --
-    seluruh grup itu dibuang.
+    itu. Tie-break: kalau modus tidak unik, seluruh grup dibuang (tidak ada
+    dasar objektif memilih salah satu).
     """
     dup_mask = df.duplicated(subset=[text_col], keep=False)
     df_dup = df[dup_mask]
@@ -173,7 +307,7 @@ def drop_text_rating_conflicts(df, text_col="cleaned_text"):
     for text, group in df_dup.groupby(text_col):
         rating_counts = group["rating"].value_counts()
         if len(rating_counts) == 1:
-            keep_groups.append(group)  # duplicate teks tapi rating sama semua, bukan konflik
+            keep_groups.append(group)
             continue
 
         top_count = rating_counts.iloc[0]
@@ -181,7 +315,7 @@ def drop_text_rating_conflicts(df, text_col="cleaned_text"):
 
         if len(modes) > 1:
             n_dropped_tie += len(group)
-            continue  # tie -- buang semua grup ini, tidak ikut disimpan
+            continue
 
         majority_rating = modes[0]
         kept = group[group["rating"] == majority_rating]
@@ -208,9 +342,13 @@ def run_preprocessing(input_path, output_path):
 
     slang_coverage = compute_slang_coverage(df)
     df = df[df["cleaned_text"].str.strip() != ""]
-    
+
+    word_counts, is_very_short = compute_text_length_distribution(df)
+    df["cleaned_text_word_count"] = word_counts
+    df["is_very_short_text"] = is_very_short
+
     n_conflicting = compute_text_rating_conflicts(df)
-    df = drop_text_rating_conflicts(df)          # <-- BARU, sebelum drop_duplicates
+    df = drop_text_rating_conflicts(df)
     df = df.drop_duplicates(subset=["cleaned_text", "rating"])
 
     final_len = len(df)
@@ -223,11 +361,10 @@ def run_preprocessing(input_path, output_path):
         "initial_rows": initial_len, "final_rows": final_len,
         "rows_dropped": initial_len - final_len,
         "text_rating_conflicts": n_conflicting,
+        "pct_very_short_text": round(is_very_short.mean() * 100, 2),
         **{f"slang_{k}": v for k, v in slang_coverage.items()},
     }
-    
-    summary_path = os.path.join(config.RESULTS_DIR, f"preprocessing_summary__{config.DATA_VERSION}.csv")
-    pd.DataFrame([summary]).to_csv(summary_path, index=False)
-    print(f"💾 Ringkasan preprocessing -> {summary_path}")
-    
+    pd.DataFrame([summary]).to_csv(
+        os.path.join(config.RESULTS_DIR, "preprocessing_summary.csv"), index=False
+    )
     return df

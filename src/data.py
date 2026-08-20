@@ -1,7 +1,24 @@
+"""
+data.py -- PyTorch Dataset untuk teks ulasan + rating, dan varian dengan
+skor sentimen eksternal (untuk P5/fusion). Backbone tunggal
+(config.PRETRAINED_MODEL_NAME = IndoBERT), sesuai Batasan Masalah Bab 1.6
+-- tokenizer di-cache sebagai satu instance modul, bukan dict per-model,
+karena tidak ada skenario ganti backbone di proyek ini.
+"""
+
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from src import config
+
+_tokenizer = None  # cache tunggal, di-load sekali saat dibutuhkan pertama kali
+
+
+def _get_tokenizer():
+    global _tokenizer
+    if _tokenizer is None:
+        _tokenizer = AutoTokenizer.from_pretrained(config.PRETRAINED_MODEL_NAME)
+    return _tokenizer
 
 
 class ReviewDataset(Dataset):
@@ -11,16 +28,10 @@ class ReviewDataset(Dataset):
     tidak perlu ingat konversi index -- semua dilakukan di sini, satu tempat.
     """
 
-    _tokenizer_cache = {}  # FIX: dict keyed by model name, bukan satu slot global
-
     def __init__(self, texts, labels):
         self.texts = texts
         self.labels = [int(l) - 1 for l in labels]  # 1-5 -> 0-4 (syarat PyTorch & CORN)
-
-        model_name = config.PRETRAINED_MODEL_NAME
-        if model_name not in ReviewDataset._tokenizer_cache:
-            ReviewDataset._tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer = ReviewDataset._tokenizer_cache[model_name]
+        self.tokenizer = _get_tokenizer()
 
     def __len__(self):
         return len(self.texts)
@@ -45,7 +56,7 @@ class ReviewDataset(Dataset):
             "attention_mask": encoding["attention_mask"].flatten(),
             "labels": torch.tensor(label, dtype=torch.long),
         }
-        
+
 
 class ReviewDatasetFusion(Dataset):
     """
@@ -59,11 +70,7 @@ class ReviewDatasetFusion(Dataset):
         self.texts = texts
         self.labels = [int(l) - 1 for l in labels]
         self.sentiment_scores = sentiment_scores
-
-        model_name = config.PRETRAINED_MODEL_NAME
-        if model_name not in ReviewDataset._tokenizer_cache:
-            ReviewDataset._tokenizer_cache[model_name] = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer = ReviewDataset._tokenizer_cache[model_name]
+        self.tokenizer = _get_tokenizer()
 
     def __len__(self):
         return len(self.texts)
