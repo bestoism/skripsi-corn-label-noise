@@ -397,4 +397,10 @@ def get_proxy_pred_probs(texts, labels):
     elif config.PROXY_ID == 3:
         return _finetune_kfold_oof(texts, labels, loss_type="corn")
     elif config.PROXY_ID == 4:
-        return
+        return _finetune_fusion_kfold_oof(texts, labels)
+    else:
+        raise ValueError(
+            f"PROXY_ID tidak dikenal: {config.PROXY_ID} (harus 0-4, sesuai 5 tahap "
+            f"ablasi Tabel 3.2 -- backbone di luar IndoBERT di luar cakupan penelitian, "
+            f"lihat Batasan Masalah Bab 1.6)."
+        )
